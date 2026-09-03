@@ -23,6 +23,11 @@
     "storage_path_template": "/dev/shm/sglang-kv-cache/{checkpoint_id}/{instance_id}",
     "storage_min_free_space": "32G"
   },
+  "weight_cache": {
+    "enabled": true,
+    "local_root": "/dev/shm/sglang-weight-cache",
+    "storage_min_free_space": "32G"
+  },
   "workload": {
     "concurrency": 1,
     "prefixes": [

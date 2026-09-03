@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Node worker for canonical KV scatter and topology-specific materialization."""
+"""Node worker for canonical KV and node-local model-weight materialization."""
 
 from __future__ import annotations
 
@@ -15,6 +15,11 @@ from .sglang_format import (
     inspect_local_materialization,
     materialize_node_from_canonical,
     scatter_node_to_canonical,
+)
+from .weights import (
+    inspect_weight_cache,
+    materialize_weight_cache,
+    weight_artifact_path,
 )
 
 
@@ -67,6 +72,14 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
 
+    weight_inspect = sub.add_parser("weight-inspect")
+    weight_inspect.add_argument("--config", required=True)
+    weight_inspect.add_argument("--path")
+    weight_materialize = sub.add_parser("weight-materialize")
+    weight_materialize.add_argument("--config", required=True)
+    weight_materialize.add_argument("--path")
+    weight_materialize.add_argument("--reserve-bytes", type=int, default=0)
+
     for name in ("inspect", "scatter", "materialize"):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
@@ -84,6 +97,18 @@ def main() -> int:
         emit(status())
         return 0
     config = load(args.config)
+    if args.command == "weight-inspect":
+        emit(inspect_weight_cache(config, args.path or weight_artifact_path(config)))
+        return 0
+    if args.command == "weight-materialize":
+        emit(
+            materialize_weight_cache(
+                config,
+                args.path or weight_artifact_path(config),
+                reserve_bytes=args.reserve_bytes,
+            )
+        )
+        return 0
     instance = config["instances"][args.instance_index]
     path = args.path or checkpoint_path(config, instance["id"])
     if args.command == "inspect":

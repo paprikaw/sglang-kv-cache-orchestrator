@@ -2,12 +2,15 @@
 
 ## State hierarchy
 
-The system has two data tiers and two identities.
+The system has shared-Disk authority and disposable node-RAM views for both KV
+state and model weights.
 
 | Object | Lifetime | Identity | Role |
 | --- | --- | --- | --- |
 | Canonical KV on shared Disk | Persistent | Canonical fingerprint | Authoritative backup and topology conversion boundary |
 | SGLang rank files in node CPU RAM | Node/booking lifetime | Materialization fingerprint plus node slot | Fast local reuse by an exact TP/PP layout |
+| Model snapshot on shared Disk | Persistent | Model revision plus config/index digests | Authoritative model source |
+| Model snapshot in node CPU RAM | Node/booking lifetime | Weight fingerprint plus boot ID | Avoid repeated shared-Disk reads across TP/PP runs |
 
 The registry losing a local cache record does not invalidate the Disk object.
 Likewise, a restarted node only loses a materialization; it can reconstruct that
@@ -29,16 +32,17 @@ adopted as `local_only` and becomes eligible for publication to Disk.
 Placement scores complete node assignments lexicographically:
 
 1. number of exact materialization hits;
-2. total remaining booking lifetime;
-3. total free `/dev/shm` capacity.
+2. number of weight-cache hits;
+3. total remaining booking lifetime;
+4. total free `/dev/shm` capacity.
 
 Busy nodes and bookings below the configured remaining-time threshold are
-excluded. A miss requires enough free CPU RAM for the target rank files plus the
-configured reserve.
+excluded. A miss requires enough free CPU RAM for missing KV rank files,
+missing model weights, and the larger configured reserve.
 
 ## Worker
 
-The worker has four commands:
+The worker exposes short-lived commands for both data types:
 
 | Command | Effect |
 | --- | --- |
@@ -46,6 +50,8 @@ The worker has four commands:
 | `inspect` | Validate every expected rank file and byte size |
 | `scatter` | Copy this node's layer/head slices into staged canonical pages |
 | `materialize` | Slice canonical pages into an atomic local SGLang directory |
+| `weight-inspect` | Validate a boot-local model manifest, all file sizes, and config/index hashes |
+| `weight-materialize` | Atomically copy the authoritative model snapshot into local CPU RAM |
 
 The controller invokes one short-lived worker command over SSH. No worker daemon
 or peer transport is required.
@@ -72,6 +78,12 @@ publish removes the incoming directory and never exposes a complete manifest.
 new local directory beside the current one. Every rank file is written through a
 temporary name. After validation, the new directory atomically replaces the old
 directory. If installation fails, the previous valid directory is restored.
+
+Weight materialization follows the same staging-and-rename transaction. Its
+fingerprint intentionally excludes topology and workload fields, so compatible
+TP and PP experiments on a node share one model copy. The manifest records the
+node boot ID; a reboot invalidates any non-RAM residue, while ordinary `/dev/shm`
+contents disappear naturally.
 
 ## Deliberately omitted mechanisms
 

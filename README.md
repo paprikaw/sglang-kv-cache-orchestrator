@@ -1,24 +1,30 @@
-# SGLang KV Cache Orchestrator
+# SGLang KV and Weight Cache Orchestrator
 
 This repository keeps persistent KV data on shared Disk and treats node-local
 CPU RAM as a disposable cache. It also converts SGLang HiCache files through a
 topology-neutral representation, so one model/prefix checkpoint can be reused
-across compatible TP and PP layouts.
+across compatible TP and PP layouts. Model weights remain authoritative on
+shared Disk and can be copied once into each active node's `/dev/shm`, avoiding
+repeated shared-filesystem reads during later server starts.
 
 ```mermaid
 flowchart LR
     A[Existing SGLang HiCache\nTP/PP rank files] -->|publish / scatter| D
     D[(Shared Disk\ncanonical KV pages)] -->|materialize / slice| B[Idle node CPU cache\nrequested TP/PP layout]
+    W[(Shared Disk\nmodel snapshot)] -->|copy once| R[Node CPU RAM\nweight cache]
     C[Controller\nregistry + Slurm state] --> A
     C --> D
     C --> B
+    C --> R
 ```
 
 The placement policy is deliberately small:
 
-1. Use an idle booked node that already has the exact requested materialization.
-2. Otherwise use another idle booked node and materialize it from canonical Disk.
-3. If Disk has no canonical object yet, build through Prefill and publish it.
+1. Maximize exact KV-materialization hits.
+2. Among equal KV choices, maximize topology-independent weight-cache hits.
+3. Then prefer remaining booking lifetime and free `/dev/shm` capacity.
+4. Materialize misses from authoritative shared Disk. If Disk has no canonical
+   KV object yet, build through Prefill and publish it.
 
 There is no peer-to-peer cache copy, node-lifetime migration loop, or cache
 daemon. Workers are short-lived commands invoked over SSH.
@@ -60,6 +66,7 @@ Other environment variables:
 | `SGLANG_KV_REGISTRY` | `~/.local/state/sglang-kv-cache-orchestrator/registry.json` | Canonical and local-cache metadata |
 | `SGLANG_KV_DISK_ROOT` | `~/.cache/sglang-kv-cache-orchestrator/canonical` | Fallback canonical Disk root |
 | `SGLANG_KV_LOCAL_ROOT` | `/dev/shm` | Safety boundary for node-local paths |
+| `SGLANG_WEIGHT_CACHE_ROOT` | `/dev/shm/sglang-weight-cache` | Node-local model-cache root |
 
 For a cluster deployment, set `checkpoint_store.disk_root` in each config to a
 shared persistent filesystem and place the registry there as well.
@@ -90,6 +97,24 @@ deterministic token sequences.
 Every prefix must be page aligned. PP greater than one requires an explicit
 `layer_partition`. Rank order follows SGLang's `global_rank = pp_rank * TP +
 tp_rank`; ranks are distributed uniformly across the listed nodes.
+
+Enable node-local weights with:
+
+```json
+{
+  "weight_cache": {
+    "enabled": true,
+    "local_root": "/dev/shm/sglang-weight-cache",
+    "storage_min_free_space": "64G"
+  }
+}
+```
+
+The weight fingerprint uses model revision, config/index digests, dtype, and
+quantization, but no TP, PP, node, or KV-prefix fields. PP4 and TP4 therefore
+reuse the same local model copy. `common.model` always remains the authoritative
+shared-Disk path; a resolved config adds `weight_cache.runtime_model_path` for
+the serving process.
 
 ## Commands
 
@@ -136,6 +161,20 @@ config directly. If neither an exact local cache nor canonical Disk exists,
 `prepare` returns `next_action=run_prefill_then_publish`; the serving harness
 runs Prefill and then calls `publish`.
 
+Inspect or explicitly populate the weight cache on nodes already named by a
+config:
+
+```bash
+sglang-kv-cache weight-status --config resolved.json
+sglang-kv-cache weight-materialize --config resolved.json
+```
+
+`prepare` performs the same weight materialization automatically. Population is
+locked and atomic: workers copy into a staging directory, verify every file size
+plus the model config/index hashes, then rename the complete object into place.
+Later server starts still deserialize and transfer weights from CPU RAM to GPU;
+the cache removes repeated shared-Disk reads rather than GPU load time itself.
+
 ## Correctness boundary
 
 Reuse requires the same engine/file-format identity, model revision and weight
@@ -151,5 +190,6 @@ python3 -m pytest
 python3 -m ruff check .
 ```
 
-Tests use byte-exact synthetic pages and exercise PP4, TP4, and TP2PP2 in both
-directions.
+Tests use byte-exact synthetic pages and model files. They exercise PP4, TP4,
+and TP2PP2 conversion in both directions, atomic weight copies, corruption
+detection, capacity accounting, and cache-aware placement.

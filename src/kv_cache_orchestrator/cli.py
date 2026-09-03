@@ -12,10 +12,14 @@ from .controller import (
     choose_placement,
     discover_cache_hits,
     discover_slurm_candidates,
+    discover_weight_cache_hits,
     hydrate_config_from_disk,
+    inspect_configured_weights,
+    materialize_configured_weights,
     prepare_cache_aware_config,
     publish_checkpoint_to_disk,
     resolve_config,
+    worker_weight_probe,
 )
 from .registry import (
     DEFAULT_REGISTRY,
@@ -29,6 +33,7 @@ from .sglang_format import (
     materialization_fingerprint,
     materialization_spec,
 )
+from .weights import weight_cache_enabled, weight_fingerprint, weight_identity
 
 
 def emit(value: object) -> None:
@@ -63,6 +68,18 @@ def main() -> int:
     status.add_argument("--config", required=True)
     status.add_argument("--no-live-verify", action="store_true")
     status.add_argument("--verify-disk-files", action="store_true")
+
+    weight_status = sub.add_parser(
+        "weight-status", help="Inspect configured nodes for the model-weight cache"
+    )
+    weight_status.add_argument("--config", required=True)
+
+    weight_materialize = sub.add_parser(
+        "weight-materialize",
+        help="Copy shared-Disk model weights into configured nodes' CPU RAM",
+    )
+    weight_materialize.add_argument("--config", required=True)
+    weight_materialize.add_argument("--allow-busy", action="store_true")
 
     publish = sub.add_parser(
         "publish", help="Convert the configured TP/PP cache into canonical Disk pages"
@@ -104,7 +121,7 @@ def main() -> int:
 
     config_path = Path(args.config).resolve()
     config = load_config(config_path)
-    config["checkpoint_registry"] = str(registry)
+    config["orchestrator_registry"] = str(registry)
     if args.command == "fingerprint":
         emit(
             {
@@ -112,6 +129,13 @@ def main() -> int:
                 "canonical_spec": canonical_spec(config),
                 "materialization_fingerprint": materialization_fingerprint(config),
                 "materialization_spec": materialization_spec(config),
+                "weight_cache_enabled": weight_cache_enabled(config),
+                "weight_fingerprint": (
+                    weight_fingerprint(config) if weight_cache_enabled(config) else None
+                ),
+                "weight_identity": (
+                    weight_identity(config) if weight_cache_enabled(config) else None
+                ),
             }
         )
         return 0
@@ -122,8 +146,20 @@ def main() -> int:
             verify_live=not args.no_live_verify,
             verify_disk_files=args.verify_disk_files,
         )
+        result["weight_cache"] = inspect_configured_weights(config, config_path)
         emit(result)
         return 0 if result["hit"] else 3
+    if args.command == "weight-status":
+        result = inspect_configured_weights(config, config_path)
+        emit(result)
+        return 0 if all(row.get("valid") for row in result["nodes"]) else 3
+    if args.command == "weight-materialize":
+        emit(
+            materialize_configured_weights(
+                config, config_path, allow_busy=args.allow_busy
+            )
+        )
+        return 0
     if args.command == "publish":
         emit(publish_checkpoint_to_disk(config, config_path, args.run_dir, registry))
         return 0
@@ -160,6 +196,11 @@ def main() -> int:
         job_name_regex=args.job_name_regex,
     )
     discover_cache_hits(config, discovered, registry)
+    discover_weight_cache_hits(
+        config,
+        discovered,
+        probe=worker_weight_probe(config_path),
+    )
     placement = choose_placement(
         config,
         discovered,

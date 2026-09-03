@@ -6,6 +6,7 @@ from kv_cache_orchestrator.controller import (
     _existing_backing,
     choose_placement,
     discover_cache_hits,
+    discover_weight_cache_hits,
     parse_slurm_time_left,
 )
 from kv_cache_orchestrator.registry import (
@@ -40,6 +41,7 @@ def candidate(
     seconds: float = 10_000,
     free: int = 1_000_000,
     busy: bool = False,
+    weight_cached: bool = False,
 ):
     return {
         "node": node,
@@ -53,6 +55,7 @@ def candidate(
         "busy": busy,
         "health": {"gpu_count": 4, "shm_free_bytes": free},
         "cached_slots": ["0:0"] if cached else [],
+        "weight_cache_hit": weight_cached,
     }
 
 
@@ -147,6 +150,24 @@ def test_cache_discovery_probes_unregistered_candidate_paths(tmp_path):
     assert candidates[1]["cached_slots"] == []
 
 
+def test_weight_cache_discovery_probes_each_idle_candidate(tmp_path):
+    config = make_config(tmp_path)
+    config["weight_cache"] = {
+        "enabled": True,
+        "local_root": str(tmp_path / "weights"),
+    }
+    candidates = [candidate("cached"), candidate("empty")]
+
+    discover_weight_cache_hits(
+        config,
+        candidates,
+        probe=lambda _config, node: {"valid": node == "cached"},
+    )
+
+    assert candidates[0]["weight_cache_hit"] is True
+    assert candidates[1]["weight_cache_hit"] is False
+
+
 def test_live_lookup_adopts_complete_unregistered_materialization(tmp_path):
     config = make_config(tmp_path)
     registry = tmp_path / "registry.json"
@@ -186,6 +207,41 @@ def test_placement_falls_back_to_prefill_without_disk(tmp_path):
 
     assert plan["canonical_disk_available"] is False
     assert plan["decisions"][0]["cache_action"] == "build_from_prefill"
+
+
+def test_placement_prefers_weight_hit_when_kv_hits_are_equal(tmp_path):
+    config = make_config(tmp_path)
+    config["weight_cache"] = {
+        "enabled": True,
+        "local_root": str(tmp_path / "weights"),
+    }
+    candidates = [
+        candidate("weight-hit", weight_cached=True, seconds=5_000),
+        candidate("longer", seconds=50_000),
+    ]
+
+    plan = choose_placement(config, candidates, tmp_path / "registry.json")
+
+    decision = plan["decisions"][0]
+    assert decision["node"] == "weight-hit"
+    assert decision["weight_cache_action"] == "reuse_local"
+    assert plan["weight_cache_hits"] == 1
+
+
+def test_placement_capacity_accounts_for_missing_weights(tmp_path):
+    config = make_config(tmp_path)
+    config["weight_cache"] = {
+        "enabled": True,
+        "local_root": str(tmp_path / "weights"),
+    }
+    (tmp_path / "model" / "large.bin").write_bytes(b"x" * 2_000_000)
+
+    with pytest.raises(RuntimeError, match="enough /dev/shm capacity"):
+        choose_placement(
+            config,
+            [candidate("too-small", free=1_500_000)],
+            tmp_path / "registry.json",
+        )
 
 
 def test_placement_rejects_gpu_shape_mismatch(tmp_path):

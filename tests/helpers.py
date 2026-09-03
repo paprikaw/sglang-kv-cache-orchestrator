@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -32,7 +33,8 @@ def make_config(
 ) -> dict:
     model = root / "model"
     model.mkdir(parents=True, exist_ok=True)
-    (model / "config.json").write_text(
+    model_config = model / "config.json"
+    model_config.write_text(
         json.dumps(
             {
                 "num_hidden_layers": num_layers,
@@ -42,6 +44,20 @@ def make_config(
             }
         )
     )
+    model_index = model / "model.safetensors.index.json"
+    model_index.write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 16},
+                "weight_map": {"layer.weight": "model-00001-of-00001.safetensors"},
+            }
+        )
+    )
+    (model / "model-00001-of-00001.safetensors").write_bytes(bytes(range(16)))
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
     prefixes = prefixes or [[1, 2, 3, 4]]
     nodes = nodes or ["node0"]
     instance = {
@@ -63,8 +79,8 @@ def make_config(
             "source_commit": "0123456789abcdef",
             "model": str(model),
             "model_revision": "model-revision",
-            "model_config_sha256": "config-digest",
-            "model_index_sha256": "index-digest",
+            "model_config_sha256": digest(model_config),
+            "model_index_sha256": digest(model_index),
             "served_model_name": "Tiny-GQA",
             "dtype": "float16",
             "quantization": None,

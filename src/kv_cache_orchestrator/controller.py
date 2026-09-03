@@ -38,6 +38,13 @@ from .sglang_format import (
     planned_materializations,
     prompt_pages,
 )
+from .weights import (
+    runtime_model_path,
+    source_weight_inventory,
+    weight_artifact_path,
+    weight_cache_enabled,
+    weight_fingerprint,
+)
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SLURM_BIN = Path("/apps/slurm/latest/bin")
@@ -504,6 +511,33 @@ def discover_cache_hits(
     return candidates
 
 
+def discover_weight_cache_hits(
+    config: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    probe: Callable[[dict[str, Any], str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Probe the topology-independent model-weight cache on every idle node."""
+    enabled = weight_cache_enabled(config)
+    artifact = str(weight_artifact_path(config)) if enabled else None
+    for candidate in candidates:
+        candidate.setdefault("weight_cache_hit", False)
+        candidate.setdefault("weight_cache_observation", None)
+        if not enabled or candidate.get("busy"):
+            continue
+        try:
+            observed = probe(config, str(candidate["node"]))
+        except Exception as exc:
+            observed = {
+                "valid": False,
+                "artifact_path": artifact,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        candidate["weight_cache_observation"] = observed
+        candidate["weight_cache_hit"] = bool(observed.get("valid"))
+    return candidates
+
+
 def choose_placement(
     config: dict[str, Any],
     candidates: list[dict[str, Any]],
@@ -512,7 +546,17 @@ def choose_placement(
     min_time_left_seconds: float = 3600.0,
 ) -> dict[str, Any]:
     targets = planned_materializations(config)
-    reserve = parse_byte_size(config["hicache"].get("storage_min_free_space", 0))
+    kv_reserve = parse_byte_size(config["hicache"].get("storage_min_free_space", 0))
+    weights_enabled = weight_cache_enabled(config)
+    weight_bytes = (
+        int(source_weight_inventory(config)["bytes"]) if weights_enabled else 0
+    )
+    weight_reserve = (
+        parse_byte_size(config["weight_cache"].get("storage_min_free_space", 0))
+        if weights_enabled
+        else 0
+    )
+    reserve = max(kv_reserve, weight_reserve)
     lookup = lookup_checkpoint(config, Path(registry_path), verify_live=False)
     eligible = []
     rejected = []
@@ -537,6 +581,7 @@ def choose_placement(
     best = None
     for assignment in itertools.permutations(eligible, len(targets)):
         hits = 0
+        weight_hits = 0
         lifetime = 0.0
         free_total = 0.0
         feasible = True
@@ -548,17 +593,25 @@ def choose_placement(
                 break
             cached = _slot(target) in candidate.get("cached_slots", [])
             hits += int(cached)
+            weight_cached = weights_enabled and bool(
+                candidate.get("weight_cache_hit", False)
+            )
+            weight_hits += int(weight_cached)
             left = candidate.get("time_left_seconds")
             lifetime += 10**12 if left is None else float(left)
             free = float(candidate.get("health", {}).get("shm_free_bytes") or 0)
             free_total += free
-            needed = reserve + (0 if cached else int(target["expected_bytes"]))
+            needed = (
+                reserve
+                + (0 if cached else int(target["expected_bytes"]))
+                + (0 if weight_cached else weight_bytes)
+            )
             if free < needed:
                 feasible = False
                 break
         if not feasible:
             continue
-        score = (hits, lifetime, free_total)
+        score = (hits, weight_hits, lifetime, free_total)
         if best is None or score > best[0]:
             best = (score, assignment)
     if best is None:
@@ -567,6 +620,9 @@ def choose_placement(
     decisions = []
     for target, candidate in zip(targets, best[1], strict=True):
         cached = _slot(target) in candidate.get("cached_slots", [])
+        weight_cached = weights_enabled and bool(
+            candidate.get("weight_cache_hit", False)
+        )
         action = (
             "reuse_local"
             if cached
@@ -587,6 +643,16 @@ def choose_placement(
                 "job_id": candidate["job_id"],
                 "local_cache_hit": cached,
                 "cache_action": action,
+                "weight_cache_hit": weight_cached,
+                "weight_cache_action": (
+                    "disabled"
+                    if not weights_enabled
+                    else (
+                        "reuse_local"
+                        if weight_cached
+                        else "materialize_from_shared_disk"
+                    )
+                ),
                 "time_left": candidate["time_left"],
                 "end_time": candidate["end_time"],
             }
@@ -596,6 +662,10 @@ def choose_placement(
         "materialization_fingerprint": materialization_fingerprint(config),
         "canonical_disk_available": bool(lookup["hit"]),
         "cache_hits": sum(row["local_cache_hit"] for row in decisions),
+        "weight_cache_enabled": weights_enabled,
+        "weight_fingerprint": (weight_fingerprint(config) if weights_enabled else None),
+        "weight_cache_bytes": weight_bytes,
+        "weight_cache_hits": sum(row["weight_cache_hit"] for row in decisions),
         "required_nodes": len(targets),
         "decisions": decisions,
         "rejected": rejected,
@@ -629,6 +699,28 @@ def worker_probe(
     return probe
 
 
+def worker_weight_probe(
+    config_path: str | Path,
+    *,
+    runner: WorkerRunner = remote_worker,
+) -> Callable[[dict[str, Any], str], dict[str, Any]]:
+    path = Path(config_path).resolve()
+
+    def probe(config: dict[str, Any], node: str) -> dict[str, Any]:
+        del config
+        try:
+            return worker_json(
+                node,
+                ["weight-inspect", "--config", str(path)],
+                timeout=900,
+                runner=runner,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"valid": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return probe
+
+
 def resolve_config(config: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(config)
     decisions = {row["slot"]: row for row in plan["decisions"]}
@@ -656,10 +748,90 @@ def resolve_config(config: dict[str, Any], plan: dict[str, Any]) -> dict[str, An
     }
     result["placement_resolution"] = {
         "resolved_at": time.time(),
-        "policy": "prefer_idle_matching_materialization_then_canonical_disk",
+        "policy": "prefer_kv_then_weight_cache_then_lifetime_then_free_ram",
         "plan": plan,
     }
+    if weight_cache_enabled(result):
+        result["weight_cache"]["fingerprint"] = weight_fingerprint(result)
+        result["weight_cache"]["runtime_model_path"] = str(runtime_model_path(result))
     return result
+
+
+def inspect_configured_weights(
+    config: dict[str, Any],
+    config_path: str | Path,
+    *,
+    runner: WorkerRunner = remote_worker,
+) -> dict[str, Any]:
+    if not weight_cache_enabled(config):
+        return {"enabled": False, "nodes": []}
+    config_file = Path(config_path).resolve()
+    rows = []
+    nodes = sorted(
+        {str(node) for instance in config["instances"] for node in instance["nodes"]}
+    )
+    for node in nodes:
+        observed = worker_json(
+            node,
+            ["weight-inspect", "--config", str(config_file)],
+            timeout=900,
+            runner=runner,
+        )
+        rows.append({"node": node, **observed})
+    return {
+        "enabled": True,
+        "weight_fingerprint": weight_fingerprint(config),
+        "runtime_model_path": str(runtime_model_path(config)),
+        "nodes": rows,
+    }
+
+
+def materialize_configured_weights(
+    config: dict[str, Any],
+    config_path: str | Path,
+    *,
+    allow_busy: bool = False,
+    runner: WorkerRunner = remote_worker,
+) -> dict[str, Any]:
+    if not weight_cache_enabled(config):
+        return {"status": "disabled", "nodes": []}
+    config_file = Path(config_path).resolve()
+    reserve = parse_byte_size(config["weight_cache"].get("storage_min_free_space", 0))
+    nodes = sorted(
+        {str(node) for instance in config["instances"] for node in instance["nodes"]}
+    )
+    statuses = {}
+    for node in nodes:
+        node_status = worker_json(node, ["status"], timeout=180, runner=runner)
+        statuses[node] = node_status
+        if node_status.get("busy") and not allow_busy:
+            raise RuntimeError(f"refusing to materialize weights on busy node {node}")
+    transfers = []
+    for node in nodes:
+        result = worker_json(
+            node,
+            [
+                "weight-materialize",
+                "--config",
+                str(config_file),
+                "--reserve-bytes",
+                str(reserve),
+            ],
+            timeout=14400,
+            runner=runner,
+        )
+        transfers.append({"node": node, **result})
+    inspection = inspect_configured_weights(config, config_file, runner=runner)
+    if not all(row.get("valid") for row in inspection["nodes"]):
+        raise RuntimeError(f"weight materialization failed validation: {inspection}")
+    return {
+        "status": "ready",
+        "weight_fingerprint": weight_fingerprint(config),
+        "runtime_model_path": str(runtime_model_path(config)),
+        "node_status": statuses,
+        "transfers": transfers,
+        "inspection": inspection,
+    }
 
 
 def prepare_cache_aware_config(
@@ -675,7 +847,7 @@ def prepare_cache_aware_config(
     runner: WorkerRunner = remote_worker,
 ) -> dict[str, Any]:
     config = copy.deepcopy(config)
-    config["checkpoint_registry"] = str(registry_path)
+    config["orchestrator_registry"] = str(registry_path)
     candidates = discover_slurm_candidates(
         config,
         candidate_nodes=candidate_nodes,
@@ -687,6 +859,11 @@ def prepare_cache_aware_config(
         candidates,
         registry_path,
         probe=worker_probe(source_config_path, runner=runner),
+    )
+    discover_weight_cache_hits(
+        config,
+        candidates,
+        probe=worker_weight_probe(source_config_path, runner=runner),
     )
     plan = choose_placement(
         config,
@@ -736,4 +913,8 @@ def prepare_cache_aware_config(
         )
     elif not lookup["hit"]:
         result["next_action"] = "run_prefill_then_publish"
+    if weight_cache_enabled(resolved):
+        result["weight_materialization"] = materialize_configured_weights(
+            resolved, output, runner=runner
+        )
     return result

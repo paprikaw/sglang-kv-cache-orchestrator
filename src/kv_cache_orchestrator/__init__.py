@@ -7,6 +7,12 @@ from .sglang_format import (
     materialization_fingerprint,
     materialization_spec,
 )
+from .weights import (
+    WEIGHT_CACHE_FORMAT_VERSION,
+    runtime_model_path,
+    weight_fingerprint,
+    weight_identity,
+)
 
 __all__ = [
     "CANONICAL_FORMAT_VERSION",
@@ -14,6 +20,10 @@ __all__ = [
     "canonical_spec",
     "materialization_fingerprint",
     "materialization_spec",
+    "WEIGHT_CACHE_FORMAT_VERSION",
+    "runtime_model_path",
+    "weight_fingerprint",
+    "weight_identity",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
