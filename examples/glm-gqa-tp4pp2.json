@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "topology": "tp4pp2",
+  "checkpoint_id": "glm-gqa-prefix-v1",
+  "checkpoint_store": {
+    "disk_root": "/shared/sglang-kv/canonical"
+  },
+  "common": {
+    "engine": "sglang",
+    "engine_version": "0.5.18",
+    "source_commit": "replace-with-pinned-sglang-commit",
+    "model": "/shared/models/GLM-GQA",
+    "model_revision": "replace-with-model-revision",
+    "model_config_sha256": "replace-with-config-sha256",
+    "model_index_sha256": "replace-with-index-sha256",
+    "served_model_name": "GLM-GQA",
+    "dtype": "bfloat16",
+    "quantization": "moe_wna16",
+    "page_size": 64
+  },
+  "hicache": {
+    "mem_layout": "page_first",
+    "storage_path_template": "/dev/shm/sglang-kv-cache/{checkpoint_id}/{instance_id}",
+    "storage_min_free_space": "32G"
+  },
+  "workload": {
+    "concurrency": 1,
+    "prefixes": [
+      {"token_file": "prefix.json"}
+    ],
+    "routing": "single"
+  },
+  "instances": [
+    {
+      "id": "service0",
+      "nodes": ["gpu-node-a", "gpu-node-b"],
+      "tp_size": 4,
+      "pp_size": 2,
+      "layer_partition": [46, 46]
+    }
+  ],
+  "placement": {
+    "slurm_job_name_regex": "A100|H100"
+  }
+}
