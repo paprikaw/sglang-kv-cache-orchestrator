@@ -434,7 +434,16 @@ def hydrate_config_from_disk(
             "bytes": result["inventory"]["matched_bytes"],
             "peer_attempts": peer_attempts,
         }
-        for key in ("source", "transport", "route", "duration_s", "throughput_bytes_s"):
+        for key in (
+            "source",
+            "transport",
+            "route",
+            "duration_s",
+            "throughput_bytes_s",
+            "pruned_file_count",
+            "pruned_bytes",
+            "pruned_sample",
+        ):
             if key in result:
                 transfer[key] = result[key]
         transfers.append(transfer)
