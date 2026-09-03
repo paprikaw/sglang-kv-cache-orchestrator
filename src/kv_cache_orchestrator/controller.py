@@ -340,7 +340,20 @@ def hydrate_config_from_disk(
         )
         peer_attempts = []
         result = None
-        if current.get("valid"):
+        if current.get("valid") and int(current.get("unexpected_file_count", 0)):
+            arguments = _config_worker_args("materialize", config_file, target)
+            arguments.extend(
+                [
+                    "--manifest",
+                    str(manifest_path),
+                    "--reserve-bytes",
+                    str(reserve),
+                ]
+            )
+            result = worker_json(
+                str(target["node"]), arguments, timeout=14_400, runner=runner
+            )
+        elif current.get("valid"):
             result = {"status": "already_present", "inventory": current}
         elif peer_enabled:
             candidates = compatible_local_cache_records(config, target, registry)

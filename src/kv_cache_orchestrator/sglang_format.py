@@ -361,6 +361,40 @@ def expected_local_inventory(
     return _inventory_from_files(files)
 
 
+def prune_unexpected_local_files(
+    directory: str | Path,
+    config: dict[str, Any],
+    instance_index: int,
+    node_rank: int,
+) -> dict[str, Any]:
+    """Remove pages accumulated after the immutable checkpoint was installed."""
+    root = Path(directory)
+    _ensure_below(root, LOCAL_CACHE_ROOT, "local materialization")
+    if not root.is_dir():
+        return {"pruned_file_count": 0, "pruned_bytes": 0, "pruned_sample": []}
+    expected = {
+        row["filename"]
+        for row in expected_local_files(config, instance_index, node_rank)
+    }
+    unexpected = sorted(
+        path for path in root.iterdir() if path.name not in expected
+    )
+    unsafe = [
+        path.name for path in unexpected if path.is_symlink() or not path.is_file()
+    ]
+    if unsafe:
+        raise ValueError(f"refusing unexpected non-file cache entries: {unsafe[:10]}")
+    removed_bytes = sum(path.stat().st_size for path in unexpected)
+    sample = [path.name for path in unexpected[:10]]
+    for path in unexpected:
+        path.unlink()
+    return {
+        "pruned_file_count": len(unexpected),
+        "pruned_bytes": removed_bytes,
+        "pruned_sample": sample,
+    }
+
+
 def _inventory_from_files(files: list[dict[str, Any]]) -> dict[str, Any]:
     digest = hashlib.sha256()
     for row in sorted(files, key=lambda item: item["filename"]):
@@ -395,6 +429,9 @@ def inspect_local_materialization(
             "missing_sample": [row["filename"] for row in expected[:10]],
             "wrong_size_count": 0,
             "wrong_size_sample": [],
+            "unexpected_file_count": 0,
+            "unexpected_bytes": 0,
+            "unexpected_sample": [],
             "oldest_mtime": None,
             "newest_mtime": None,
             "valid": False,
@@ -404,6 +441,10 @@ def inspect_local_materialization(
     wrong_size = []
     mtimes = []
     matched_bytes = 0
+    expected_names = {row["filename"] for row in expected}
+    unexpected = sorted(
+        path for path in root.iterdir() if path.name not in expected_names
+    )
     for row in expected:
         path = root / row["filename"]
         try:
@@ -432,6 +473,13 @@ def inspect_local_materialization(
         "missing_sample": missing[:10],
         "wrong_size_count": len(wrong_size),
         "wrong_size_sample": wrong_size[:10],
+        "unexpected_file_count": len(unexpected),
+        "unexpected_bytes": sum(
+            path.stat().st_size
+            for path in unexpected
+            if path.is_file() and not path.is_symlink()
+        ),
+        "unexpected_sample": [path.name for path in unexpected[:10]],
         "oldest_mtime": min(mtimes, default=None),
         "newest_mtime": max(mtimes, default=None),
         "valid": root.is_dir() and not missing and not wrong_size and bool(expected),
@@ -570,21 +618,22 @@ def materialize_node_from_canonical(
     destination_path = Path(destination)
     _ensure_below(destination_path, LOCAL_CACHE_ROOT, "destination")
 
-    current = inspect_local_materialization(
-        destination_path, config, instance_index, node_rank
-    )
-    if current["valid"]:
-        return {"status": "already_present", "inventory": current}
-
     expected = expected_local_inventory(config, instance_index, node_rank)
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = destination_path.parent / f".{destination_path.name}.materialize.lock"
     with _lock(lock_path):
+        normalization = prune_unexpected_local_files(
+            destination_path, config, instance_index, node_rank
+        )
         current = inspect_local_materialization(
             destination_path, config, instance_index, node_rank
         )
         if current["valid"]:
-            return {"status": "already_present", "inventory": current}
+            return {
+                "status": "already_present",
+                "inventory": current,
+                **normalization,
+            }
         free = shutil.disk_usage(destination_path.parent).free
         required = int(expected["expected_bytes"]) + int(reserve_bytes)
         if free < required:

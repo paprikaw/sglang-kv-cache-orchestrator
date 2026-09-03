@@ -127,21 +127,13 @@ def materialize_node_from_peer(
         runner=runner,
         resolver=resolver,
     )
-    current = sglang_format.inspect_local_materialization(
-        destination_path, config, instance_index, node_rank
-    )
-    if current["valid"]:
-        return {
-            "status": "already_present",
-            "source": {"node": source_node, "path": source},
-            "route": route,
-            "inventory": current,
-        }
-
     expected = sglang_format.expected_local_inventory(config, instance_index, node_rank)
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = destination_path.parent / f".{destination_path.name}.materialize.lock"
     with _materialization_lock(lock_path):
+        normalization = sglang_format.prune_unexpected_local_files(
+            destination_path, config, instance_index, node_rank
+        )
         current = sglang_format.inspect_local_materialization(
             destination_path, config, instance_index, node_rank
         )
@@ -151,6 +143,7 @@ def materialize_node_from_peer(
                 "source": {"node": source_node, "path": source},
                 "route": route,
                 "inventory": current,
+                **normalization,
             }
         free = shutil.disk_usage(destination_path.parent).free
         required = int(expected["expected_bytes"]) + int(reserve_bytes)
@@ -170,6 +163,9 @@ def materialize_node_from_peer(
             )
             if proc.returncode:
                 raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+            normalization = sglang_format.prune_unexpected_local_files(
+                staging, config, instance_index, node_rank
+            )
             installed = sglang_format.inspect_local_materialization(
                 staging, config, instance_index, node_rank
             )
@@ -195,6 +191,7 @@ def materialize_node_from_peer(
                 / max(finished - started, 1e-9),
                 "inventory": final,
                 "finished_at": finished,
+                **normalization,
             }
         except BaseException:
             if previous.exists() and not destination_path.exists():

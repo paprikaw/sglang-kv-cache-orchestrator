@@ -135,6 +135,11 @@ digest exactly match the target node. For replicated services, an instance may
 set `cache_request_indices` (for example `[0]`) so the same canonical prefix is
 materialized into more than one replica.
 
+Before reuse, `materialize` removes pages that a previous serving run appended
+after the immutable checkpoint. Peer copies likewise prune source-side extras
+from the staged destination, preventing a repeated benchmark from receiving
+unintended suffix-page hits during its timed window.
+
 The weight fingerprint uses model revision, config/index digests, dtype, and
 quantization, but no TP, PP, node, or KV-prefix fields. PP4 and TP4 therefore
 reuse the same local model copy. `common.model` always remains the authoritative

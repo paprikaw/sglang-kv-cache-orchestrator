@@ -104,6 +104,14 @@ def test_canonical_round_trip_across_tp_and_pp(
     assert canonical_fingerprint(source) == canonical_fingerprint(target)
     assert materialization_fingerprint(source) != materialization_fingerprint(target)
 
+    stale = target_dir / "post-checkpoint-page.bin"
+    stale.write_bytes(b"stale")
+    normalized = materialize_node_from_canonical(target, 0, 0, manifest, target_dir)
+    assert normalized["status"] == "already_present"
+    assert normalized["pruned_file_count"] == 1
+    assert normalized["pruned_bytes"] == 5
+    assert not stale.exists()
+
 
 def test_canonical_round_trip_across_multi_node_tp4pp2_and_tp8(tmp_path, monkeypatch):
     local_root = tmp_path / "local"
@@ -172,6 +180,21 @@ def test_inspection_rejects_wrong_sized_rank_file(tmp_path, monkeypatch):
 
     assert observed["valid"] is False
     assert observed["wrong_size_count"] == 1
+
+
+def test_inspection_reports_post_checkpoint_pages(tmp_path, monkeypatch):
+    local_root = tmp_path / "local"
+    monkeypatch.setattr(sglang_format, "LOCAL_CACHE_ROOT", local_root)
+    config = make_config(tmp_path)
+    directory = local_root / "node0"
+    write_materialization(config, [directory], global_pages(config))
+    (directory / "post-checkpoint-page.bin").write_bytes(b"stale")
+
+    observed = inspect_local_materialization(directory, config, 0, 0)
+
+    assert observed["valid"] is True
+    assert observed["unexpected_file_count"] == 1
+    assert observed["unexpected_bytes"] == 5
 
 
 def test_manifest_fingerprint_must_match(tmp_path, monkeypatch):

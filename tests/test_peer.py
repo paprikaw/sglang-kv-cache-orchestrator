@@ -35,6 +35,7 @@ def test_peer_materialization_is_validated_and_atomically_installed(
     config = make_config(tmp_path)
     source = tmp_path / "fake-remote-source"
     write_materialization(config, [source], global_pages(config))
+    (source / "post-checkpoint-page.bin").write_bytes(b"stale")
     destination = local_root / "target"
 
     def runner(argv, **_kwargs):
@@ -64,3 +65,6 @@ def test_peer_materialization_is_validated_and_atomically_installed(
     assert result["status"] == "materialized_from_peer"
     assert result["route"]["device"] == "bond0.3027"
     assert result["inventory"]["valid"] is True
+    assert result["pruned_file_count"] == 1
+    assert result["pruned_bytes"] == 5
+    assert not (destination / "post-checkpoint-page.bin").exists()
