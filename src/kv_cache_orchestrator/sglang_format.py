@@ -186,7 +186,6 @@ def layer_partition(config: dict[str, Any], instance: dict[str, Any]) -> list[in
 
 
 def materialization_spec(config: dict[str, Any]) -> dict[str, Any]:
-    assignments = endpoint_assignments(config)
     return {
         "canonical_fingerprint": canonical_fingerprint(config),
         "file_format": "sglang_hicache_file_page_first_v1",
@@ -198,9 +197,7 @@ def materialization_spec(config: dict[str, Any]) -> dict[str, Any]:
                 "tp_size": int(instance["tp_size"]),
                 "pp_size": int(instance["pp_size"]),
                 "layer_partition": layer_partition(config, instance),
-                "request_indices": [
-                    index for index, endpoint in enumerate(assignments) if endpoint == i
-                ],
+                "request_indices": request_indices_for_instance(config, i),
             }
             for i, instance in enumerate(config["instances"])
         ],
@@ -294,6 +291,21 @@ def local_file_size(
 def request_indices_for_instance(
     config: dict[str, Any], instance_index: int
 ) -> list[int]:
+    explicit = config["instances"][instance_index].get("cache_request_indices")
+    if explicit is not None:
+        if not isinstance(explicit, list) or not explicit:
+            raise ValueError("instance.cache_request_indices must be a non-empty list")
+        request_count = len(prefix_token_sequences(config))
+        values = [int(value) for value in explicit]
+        if len(values) != len(set(values)):
+            raise ValueError(
+                "instance.cache_request_indices must not contain duplicates"
+            )
+        if any(value < 0 or value >= request_count for value in values):
+            raise ValueError(
+                "instance.cache_request_indices contains an unavailable prefix index"
+            )
+        return values
     return [
         index
         for index, assigned in enumerate(endpoint_assignments(config))

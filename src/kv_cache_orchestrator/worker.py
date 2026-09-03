@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from .config import checkpoint_path, load_config
+from .peer import materialize_node_from_peer
 from .sglang_format import (
     LOCAL_CACHE_ROOT,
     inspect_local_materialization,
@@ -80,7 +81,7 @@ def main() -> int:
     weight_materialize.add_argument("--path")
     weight_materialize.add_argument("--reserve-bytes", type=int, default=0)
 
-    for name in ("inspect", "scatter", "materialize"):
+    for name in ("inspect", "scatter", "materialize", "peer-materialize"):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
         command.add_argument("--instance-index", type=int, required=True)
@@ -90,6 +91,11 @@ def main() -> int:
             command.add_argument("--destination", required=True)
         if name == "materialize":
             command.add_argument("--manifest", required=True)
+            command.add_argument("--reserve-bytes", type=int, default=0)
+        if name == "peer-materialize":
+            command.add_argument("--source-node", required=True)
+            command.add_argument("--source-path", required=True)
+            command.add_argument("--fabric-interface-regex", required=True)
             command.add_argument("--reserve-bytes", type=int, default=0)
     args = parser.parse_args()
 
@@ -126,6 +132,20 @@ def main() -> int:
                 args.node_rank,
                 path,
                 args.destination,
+            )
+        )
+        return 0
+    if args.command == "peer-materialize":
+        emit(
+            materialize_node_from_peer(
+                config,
+                args.instance_index,
+                args.node_rank,
+                args.source_node,
+                args.source_path,
+                path,
+                reserve_bytes=args.reserve_bytes,
+                interface_regex=args.fabric_interface_regex,
             )
         )
         return 0

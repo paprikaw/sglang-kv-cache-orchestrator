@@ -14,6 +14,7 @@ from kv_cache_orchestrator.sglang_format import (
     expected_local_files,
     inspect_local_materialization,
     materialization_fingerprint,
+    materialization_spec,
     materialize_node_from_canonical,
     page_hashes,
     scatter_node_to_canonical,
@@ -185,3 +186,22 @@ def test_manifest_fingerprint_must_match(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="does not match"):
         materialize_node_from_canonical(config, 0, 0, manifest, local_root / "target")
+
+
+def test_cache_request_indices_can_replicate_one_prefix_to_two_instances(tmp_path):
+    config = make_config(tmp_path)
+    first = config["instances"][0]
+    first["cache_request_indices"] = [0]
+    second = dict(first)
+    second.update({"id": "service1", "nodes": ["node1"]})
+    config["instances"].append(second)
+    config["workload"].update({"routing": "explicit", "endpoint_assignments": [0]})
+
+    spec = materialization_spec(config)
+
+    assert spec["instances"][0]["request_indices"] == [0]
+    assert spec["instances"][1]["request_indices"] == [0]
+    assert expected_local_files(config, 0, 0)
+    assert [row["filename"] for row in expected_local_files(config, 0, 0)] == [
+        row["filename"] for row in expected_local_files(config, 1, 0)
+    ]

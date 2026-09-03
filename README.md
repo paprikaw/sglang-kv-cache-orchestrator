@@ -11,6 +11,7 @@ repeated shared-filesystem reads during later server starts.
 flowchart LR
     A[Existing SGLang HiCache\nTP/PP rank files] -->|publish / scatter| D
     D[(Shared Disk\ncanonical KV pages)] -->|materialize / slice| B[Idle node CPU cache\nrequested TP/PP layout]
+    P[Peer node CPU cache\nsame file inventory] -->|fast-fabric pull first| B
     W[(Shared Disk\nmodel snapshot)] -->|copy once| R[Node CPU RAM\nweight cache]
     C[Controller\nregistry + Slurm state] --> A
     C --> D
@@ -23,11 +24,17 @@ The placement policy is deliberately small:
 1. Maximize exact KV-materialization hits.
 2. Among equal KV choices, maximize topology-independent weight-cache hits.
 3. Then prefer remaining booking lifetime and free `/dev/shm` capacity.
-4. Materialize misses from authoritative shared Disk. If Disk has no canonical
-   KV object yet, build through Prefill and publish it.
+4. For a miss, optionally pull an exact file-layout match from another node's
+   CPU cache over the configured fast-fabric route.
+5. If no peer is valid or the transfer fails, materialize from authoritative
+   shared Disk. If Disk has no canonical KV object yet, build through Prefill
+   and publish it.
 
-There is no peer-to-peer cache copy, node-lifetime migration loop, or cache
-daemon. Workers are short-lived commands invoked over SSH.
+Workers are short-lived commands invoked over SSH; there is no resident cache
+daemon. Peer transfer uses uncompressed rsync over SSH and verifies that the
+resolved route uses the required interface before copying. This supports TCP
+over RoCE or IPoIB while reporting the transport accurately rather than
+claiming RDMA-verbs transfer.
 
 The controller probes the requested cache path on eligible nodes, so a cache
 that predates the registry or survives a controller restart is still reusable.
@@ -109,6 +116,24 @@ Enable node-local weights with:
   }
 }
 ```
+
+Enable peer-first KV hydration with a Disk fallback:
+
+```json
+{
+  "peer_transfer": {
+    "enabled": true,
+    "fabric_interface_regex": "^bond0(?:\\.|$)",
+    "fallback_to_disk": true
+  }
+}
+```
+
+The controller searches every recorded materialization of the same canonical
+checkpoint and accepts a peer only when file count, total bytes, and inventory
+digest exactly match the target node. For replicated services, an instance may
+set `cache_request_indices` (for example `[0]`) so the same canonical prefix is
+materialized into more than one replica.
 
 The weight fingerprint uses model revision, config/index digests, dtype, and
 quantization, but no TP, PP, node, or KV-prefix fields. PP4 and TP4 therefore

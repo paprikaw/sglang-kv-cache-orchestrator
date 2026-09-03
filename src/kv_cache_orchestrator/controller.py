@@ -19,6 +19,7 @@ from typing import Any
 
 from .registry import (
     DEFAULT_REGISTRY,
+    compatible_local_cache_records,
     disk_backing_from_manifest,
     lookup_checkpoint,
     probe_materialization,
@@ -324,29 +325,106 @@ def hydrate_config_from_disk(
 
     rows = []
     transfers = []
+    peer_policy = config.get("peer_transfer", {})
+    peer_enabled = bool(peer_policy.get("enabled", False))
+    fabric_regex = str(
+        peer_policy.get("fabric_interface_regex", r"^(?:bond0(?:\.|$)|ib|mlx)")
+    )
+    fallback_to_disk = bool(peer_policy.get("fallback_to_disk", True))
     for target in planned_materializations(config):
-        arguments = _config_worker_args("materialize", config_file, target)
-        arguments.extend(
-            [
-                "--manifest",
-                str(manifest_path),
-                "--reserve-bytes",
-                str(reserve),
-            ]
+        current = worker_json(
+            str(target["node"]),
+            _config_worker_args("inspect", config_file, target),
+            timeout=900,
+            runner=runner,
         )
-        result = worker_json(
-            str(target["node"]), arguments, timeout=14400, runner=runner
-        )
+        peer_attempts = []
+        result = None
+        if current.get("valid"):
+            result = {"status": "already_present", "inventory": current}
+        elif peer_enabled:
+            candidates = compatible_local_cache_records(config, target, registry)
+            for source in candidates:
+                if str(source.get("node")) == str(target["node"]) and str(
+                    source.get("path")
+                ) == str(target["path"]):
+                    continue
+                source_target = {**target, "path": source["path"]}
+                attempt = {
+                    "source_node": source.get("node"),
+                    "source_path": source.get("path"),
+                }
+                try:
+                    observed = worker_json(
+                        str(source["node"]),
+                        _config_worker_args("inspect", config_file, source_target),
+                        timeout=900,
+                        runner=runner,
+                    )
+                    attempt["source_valid"] = bool(observed.get("valid"))
+                    if not observed.get("valid"):
+                        attempt["status"] = "source_invalid"
+                        peer_attempts.append(attempt)
+                        continue
+                    arguments = _config_worker_args(
+                        "peer-materialize", config_file, target
+                    )
+                    arguments.extend(
+                        [
+                            "--source-node",
+                            str(source["node"]),
+                            "--source-path",
+                            str(source["path"]),
+                            "--fabric-interface-regex",
+                            fabric_regex,
+                            "--reserve-bytes",
+                            str(reserve),
+                        ]
+                    )
+                    result = worker_json(
+                        str(target["node"]),
+                        arguments,
+                        timeout=14400,
+                        runner=runner,
+                    )
+                    attempt["status"] = result["status"]
+                    peer_attempts.append(attempt)
+                    break
+                except (OSError, RuntimeError, ValueError) as exc:
+                    attempt["status"] = "failed"
+                    attempt["error"] = f"{type(exc).__name__}: {exc}"
+                    peer_attempts.append(attempt)
+            if result is None and peer_attempts and not fallback_to_disk:
+                raise RuntimeError(
+                    f"all peer cache transfers failed for {target['node']}: "
+                    f"{peer_attempts}"
+                )
+        if result is None:
+            arguments = _config_worker_args("materialize", config_file, target)
+            arguments.extend(
+                [
+                    "--manifest",
+                    str(manifest_path),
+                    "--reserve-bytes",
+                    str(reserve),
+                ]
+            )
+            result = worker_json(
+                str(target["node"]), arguments, timeout=14400, runner=runner
+            )
         rows.append({**target, **result["inventory"]})
-        transfers.append(
-            {
-                "node": target["node"],
-                "instance_id": target["instance_id"],
-                "node_rank": target["node_rank"],
-                "status": result["status"],
-                "bytes": result["inventory"]["matched_bytes"],
-            }
-        )
+        transfer = {
+            "node": target["node"],
+            "instance_id": target["instance_id"],
+            "node_rank": target["node_rank"],
+            "status": result["status"],
+            "bytes": result["inventory"]["matched_bytes"],
+            "peer_attempts": peer_attempts,
+        }
+        for key in ("source", "transport", "route", "duration_s", "throughput_bytes_s"):
+            if key in result:
+                transfer[key] = result[key]
+        transfers.append(transfer)
     inventory = {
         "captured_at": time.time(),
         "run_dir": str(Path(run_dir or ".").resolve()),

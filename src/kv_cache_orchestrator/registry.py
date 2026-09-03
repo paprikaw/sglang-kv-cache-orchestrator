@@ -473,6 +473,41 @@ def local_cache_records(
         return list(materialized.get("local_caches", [])) if materialized else []
 
 
+def compatible_local_cache_records(
+    config: dict[str, Any],
+    expected: dict[str, Any],
+    registry_path: Path = DEFAULT_REGISTRY,
+) -> list[dict[str, Any]]:
+    """Return recorded CPU caches with the exact target-node file inventory.
+
+    Inventory matching deliberately crosses materialization fingerprints.  For
+    example, a TP4 view produced for a one-replica experiment can seed either
+    replica of a later 2xTP4 experiment without weakening canonical identity.
+    """
+    fingerprint = canonical_fingerprint(config)
+    keys = (
+        "expected_inventory_digest",
+        "expected_file_count",
+        "expected_bytes",
+    )
+    with _locked_registry(Path(registry_path)) as registry:
+        entry = registry["entries"].get(fingerprint)
+        if entry is None:
+            return []
+        rows = []
+        for materialization in entry.get("materializations", {}).values():
+            for row in materialization.get("local_caches", []):
+                if row.get("valid") and all(
+                    row.get(key) == expected.get(key) for key in keys
+                ):
+                    rows.append(dict(row))
+        return sorted(
+            rows,
+            key=lambda row: float(row.get("last_verified_at", 0)),
+            reverse=True,
+        )
+
+
 def list_checkpoints(registry_path: Path = DEFAULT_REGISTRY) -> list[dict[str, Any]]:
     with _locked_registry(Path(registry_path)) as registry:
         return sorted(
